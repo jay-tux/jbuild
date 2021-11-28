@@ -1,0 +1,363 @@
+#!/bin/zsh
+# setup
+sh='zsh'
+pth="${0:A:h}"
+
+# help mode
+helps=('-h' '--help' 'help')
+if [ ${helps[(ie)$1]} -le ${#helps} ]; then
+  shift 1
+  $sh $pth/jbuild-help $@
+  exit 0
+fi
+
+# syntax: jbuild [name] (-c [compiler]
+#           (-o [default optimization]) (-s [strictness])
+#           (-i [generate install target]) (-u [generate uninstall target])
+#           (-d [debug flag]) (-t [type]) (--no-git) (--no-init-commit)
+#           (--no-readme) (-n [license]) (-e [extra flags]) (-l [linker args])
+
+# Long version of arguments
+#  -c   --compiler
+#  -o   --opti
+#  -s   --strictness
+#  -i   --generate-install
+#  -u   --generate-uninstall (implies -i)
+#  -d   --debug-flag
+#  -t   --output-type
+#  -n   --license
+#  -e   --extra-flags
+#  -l   --link-args
+
+function get_last() {
+  echo "$@" | rev | cut -d' ' -f1 | rev
+}
+
+function default() {
+  if [ "$1" = '' ]; then
+    echo "$2"
+  else
+    get_last $1
+  fi
+}
+
+function is_invalid() {
+  valid=$1
+  value=$2
+  msg=$3
+
+  if [[ ${valid[(ie)$value]} -le ${#valid} ]]; then
+    return 1
+  fi
+
+  echo "$msg: '$value'"
+  return 0
+}
+
+function valid_comp() { # gcc/g++/nvcc supported
+  compilers=('gcc' 'g++' 'nvcc')
+  if (is_invalid "$compilers" "$1" "Invalid compiler"); then exit 2; fi
+}
+
+function valid_opti() { # gcc/nvcc supported optimization levels
+  optiok=('0' '1' '2' '3' 'fast' 'g' 's')
+  if (is_invalid "$optiok" "$1" "Invalid optimization level"); then exit 2; fi
+}
+
+function valid_pedan() {
+  last=`echo "$1" | rev | cut -c-2 | rev`
+  if [ $last = '+e' ]; then
+    v=`echo "$1" | rev | cut -c3- | rev`
+  else
+    v=$1
+  fi
+
+  ped=('off' 'warn' 'extra' 'pedantic')
+  if (is_invalid "$ped" "$v" "Invalid strictness value"); then exit 2; fi
+}
+
+function reparse_pedan() {
+  last=`echo "$1" | rev | cut -c-2 | rev`
+  if [ $last = '+e' ]; then
+    res='-Werr'
+    arg=`echo "$1" | rev | cut -c3- | rev`
+  else
+    res=''
+    arg=$1
+  fi
+
+  if [ $arg = 'off' ]; then echo $res; return 0; fi
+  res="$res -Wall"
+  if [ $arg = 'warn' ]; then echo $res; return 0; fi
+  res="$res -Wextra"
+  if [ $arg = 'extra']; then echo $res; return 0; fi
+  res="$res -pedantic"
+  echo $res
+}
+
+function valid_dflag() {
+  if [ "$1" = '' ]; then  # no debug flag
+    return 0
+  fi
+  regex='^[a-zA-Z_][a-zA-Z0-9_]*' # non empty, start with a-zA-Z_, only alphanum & _
+  if [[ "$1" =~ "$regex" ]]; then
+    return 0
+  else
+    echo "Invalid debug flag: '$1'"
+    return 1
+  fi
+}
+
+function valid_otype() {
+  outtypes=('exec' 'lib' 'so')
+  if (is_invalid "$outtypes" "$1" "Invalid output type"); then exit 2; fi
+}
+
+function valid_lic() {
+  licenses=`curl "https://api.github.com/licenses" 2>/dev/null | grep 'key' | cut -d'"' -f4`
+  licenses=("${(f)licenses}")
+
+  if [ "$1" = '' ]; then return 0; fi # no license
+  if (is_invalid "$licenses" "$1" "Unknown2 license"); then exit 2; fi
+}
+
+function clean_extra() {
+  res=""
+  invalids=('-e' '--extra-flags')
+  for word in $@; do
+    if [[ ${invalids[(ie)$word]} -le ${#invalids} ]]; then
+    else
+      res="$res$word "
+    fi
+  done
+  echo $res
+}
+
+function clean_lnk() {
+  res=""
+  invalids=('-l' '--link-args')
+  for word in $@; do
+    if [[ ${invalids[(ie)$word]} -le ${#invalids} ]]; then
+    else
+      res="$res$word "
+    fi
+  done
+  echo $res
+}
+
+if (( $# < 1 )); then
+  echo 'Expected at least [name]'
+  exit 1
+fi
+
+name=$1
+shift 1
+
+zmodload zsh/zutil
+zparseopts -D -E -F - c+:=comp -compiler+:=comp \
+  o:=optim -opti:=optim s:=pedan -strictness:=pedan i+=inst -install+=inst \
+  u+=uninst -uninstall+=uninst d:=deb_fl -debug:=deb_fl t:=type -output-type:=type \
+  -no-git+=n_git -no-init-commit+=n_cm -no-readme+=no_rm n:=lic -license:=lic \
+  e+:=extra -extra-flags+:=extra l+:=lnk -link-args+:=lnk || exit 1
+
+# re-parse options
+comp=`default "$comp" 'gcc'` # GCC is default compiler
+valid_comp "$comp" || exit 2
+
+optim=`default "$optim" '0'` # no optimizations by default
+valid_opti "$optim" || exit 2
+
+pedan=`default "$pedan" 'warn'` # default: -Wall = much warnings
+valid_pedan "$pedan" || exit 2
+
+inst=`default "$inst" 0` # default no install target
+if [ $inst != 0 ]; then inst=1; fi
+
+uninst=`default "$uninst" 0` # default no uninstall target
+if [ $uninst != 0 ]; then
+  uninst=1
+  inst=1 # generate uninstall => generate install
+fi
+
+# no default debug flag. No flag? Debugging off
+deb_fl=`get_last $deb_fl`
+valid_dflag "$deb_fl" || exit 2
+
+type=`default "$type" 'exec'` # create executable by default
+valid_otype "$type" || exit 2
+
+n_git=`default "$n_git" 0` # enable git by default
+if [ $n_git != 0 ]; then n_git=1; fi
+
+n_cm=`default "$n_cm" 0` # enable first commit by default
+if [ $n_cm != 0 ]; then
+  n_cm=1
+else
+  n_git=0
+fi
+
+no_rm=`default "$no_rm" 0` # enable simple readme by default
+if [ $no_rm != 0 ]; then no_rm=1; fi
+
+# no default license
+lic=`get_last $lic`
+valid_lic "$lic" || exit 2
+
+extra=`clean_extra $extra`
+lnk=`clean_lnk $lnk`
+
+echo "Name:                   $name"
+echo "Compiler:               $comp"
+echo "Optimization lvl:       $optim"
+echo "Strictness:             $pedan"
+echo "Generate install?       $inst"
+echo "Generate uninstall?     $uninst"
+echo "Debug flag:             $deb_fl"
+echo "Output type:            $type"
+echo "Git?                    $n_git"
+echo "Initial git commit?     $n_cm"
+echo "Generate readme?        $no_rm"
+echo "License:                $lic"
+echo "Extra compiler flags:   $extra"
+echo "Extra linker flags:     $lnk"
+
+langs=('c' 'cpp' 'cu')
+dirs=('src' 'obj' 'inc')
+objdirs=('obj/c' 'obj/cpp' 'obj/cu')
+if [ $deb_fl ]; then objdirs=($objdirs 'obj/dbg/c' 'obj/dbg/cpp' 'obj/dbg/cu'); fi
+phony=('all' 'clean')
+if [ $deb_fl ]; then phony=($phony 'debug'); fi
+if [ $inst = 1 ]; then phony=($phony 'install'); fi
+if [ $uninst = 1 ]; then phony=($phony 'uninstall'); fi
+
+# directory structure creation
+if [ ! -d "$PWD/$name" ]; then mkdir -p "$PWD/$name"; fi
+for subdir in $dirs; do
+  mkdir "$PWD/$name/$subdir"
+done
+
+if [ "$type" = 'exec' ]; then mkdir "$PWD/$name/bin"
+else mkdir "$PWD/$name/lib"; fi
+
+# prepare
+ccargs="-c -Iinc/"
+# if [ $comp != 'nvcc' ]; then ccargs="$ccargs -MMD"; fi # TODO: fix passing -MMD on GCC
+tmp=`reparse_pedan "$pedan"`
+ccargs="$ccargs $tmp $extra"
+if [ $type = 'so' ]; then ccargs="$ccargs -fPIC"; fi
+
+case $type in
+'exec')
+  outfile="bin/$name"
+  outd="bin/debug"
+  ;;
+'lib')
+  outfile="lib/lib$name.a"
+  outd="lib/lib$name-d.a"
+  ;;
+'so')
+  outfile="lib/lib$name.so"
+  outd="lib/lib$name-d.so"
+  ;;
+esac
+
+# makefile generation
+mkf="$PWD/$name/Makefile"
+echo "CC=$comp" >"$mkf"
+echo "CCARGS=$ccargs" >>"$mkf"
+echo "LDARGS=$lnk" >>"$mkf"
+echo "DIRS=$objdirs" >>"$mkf"
+echo "" >>"$mkf"
+echo "CSOURCES=\$(shell find src/ -name '*\\.c')" >>"$mkf"
+echo "CPPSOURCES=\$(shell find src/ -name '*\\.cpp')" >>"$mkf"
+echo "CUSOURCES=\$(shell find src/ -name '*\\.cu')" >>"$mkf"
+echo "" >>"$mkf"
+echo "COBJ=\$(CSOURCES:src/%.c=obj/c/%.o)" >>"$mkf"
+echo "CPPOBJ=\$(CPPSOURCES:src/%.cpp=obj/cpp/%.o)" >>"$mkf"
+echo "CUOBJ=\$(CUSOURCES:src/%.c=obj/cu/%.o)" >>"$mkf"
+echo "" >>"$mkf"
+
+if [ $deb_fl ]; then
+  echo "CDOBJ=\$(CSOURCES:src/%.c=obj/dbg/c/%.o)" >>"$mkf"
+  echo "CPPDOBJ=\$(CPPSOURCES:src/%.cpp=obj/dbg/cpp/%.o)" >>"$mkf"
+  echo "CUDOBJ=\$(CUSOURCES:src/%.c=obj/dbg/cu/%.o)" >>"$mkf"
+  echo "" >>"$mkf"
+fi
+
+echo "all: $outfile" >>"$mkf"
+if [ $deb_fl ]; then echo "debug: $outd" >>"$mkf"; fi
+echo "" >>"$mkf"
+
+echo "$outfile: \$(COBJ) \$(CPPOBJ) \$(CUOBJ)" >>"$mkf"
+echo "  \$(CC) \$^ \$(LDARGS) -o $outfile" >>"$mkf"
+echo "" >>"$mkf"
+
+for lang in $langs; do
+  echo "obj/$lang/%.o: src/%.$lang Makefile" >>"$mkf"
+  echo "  \$(CC) \$(CCARGS) -c \$< -o \$@" >>"$mkf"
+  echo "" >>"$mkf"
+  if [ $deb_fl ]; then
+    echo "obj/dbg/$lang/%.o: src/%.$lang Makefile" >>"$mkf"
+    echo "  \$(CC) \$(CCARGS) -O0 -g -D$deb_fl -c \$< -o \$@" >>"$mkf"
+    echo "" >>"$mkf"
+  fi
+done
+
+echo "clean:" >>"$mkf"
+echo "  rm -rf obj/*" >>"$mkf"
+echo "  mkdir -p \$(DIRS)" >>"$mkf"
+echo "" >>"$mkf"
+
+if [ $inst = 1 ]; then
+  echo "install: $outfile" >>"$mkf"
+  if [ $type = 'exec' ]; then
+    echo "  sudo cp $outfile /usr/bin/$outfile" >>"$mkf"
+  else
+    echo "  sudo cp $outfile /usr/lib/$outfile" >>"$mkf"
+    echo "  sudo cp -r inc/* /usr/include/$name/" >>"$mkf"
+  fi
+  echo "" >>"$mkf"
+fi
+
+if [ $uninst = 1 ]; then
+  echo "uninstall: " >>"$mkf"
+  if [ $type = 'exec' ]; then
+    echo "  sudo rm -f /usr/bin/$outfile" >>"$mkf"
+  else
+    echo "  sudo rm -f /usr/lib/$outfile" >>"$mkf"
+    echo "  sudo rm -rf /usr/include/$name/" >>"$mkf"
+  fi
+  echo "" >>"$mkf"
+fi
+
+echo ".PHONY: $phony" >>"$mkf"
+
+if [ $no_rm = 0 ]; then
+  cd "$name"
+  echo "# $name" >README.md
+  cd ..
+fi
+
+if [ "$lic" != '' ]; then
+  cd "$name"
+  curl "https://api.github.com/licenses/mpl-2.0" 2>/dev/null | grep 'body' \
+  | cut -c12- | rev | cut -c3- | rev >LICENSE
+  cd ..
+fi
+
+if [ $n_git = 0 ]; then
+  cd "$name"
+  git init
+  echo 'obj/*' >>.gitignore
+  if [ $type = 'exec' ]; then
+    echo 'bin/*' >>.gitignore
+  else
+    echo 'lib/*' >>.gitignore
+  fi
+
+  if [ $n_cm = 0 ]; then
+    git add .
+    git commit -m "Initial commit (using jbuild)"
+  fi
+  cd ..
+fi
